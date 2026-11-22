@@ -47,10 +47,10 @@ if not SKIP_CUDA_BUILD:
     SUPPORTED_ARCHS = {"8.0", "8.6", "8.9", "9.0", "10.0" "12.0"}
 
     # Compiler flags.
-    CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+    CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++20", "-DENABLE_BF16"]
     NVCC_FLAGS = [
         "-O3",
-        "-std=c++17",
+        "-std=c++20",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "--use_fast_math",
@@ -139,6 +139,10 @@ if not SKIP_CUDA_BUILD:
             "CUDA 12.8 or higher is required for compute capability 12.0.")
 
     # Add target compute capabilities to NVCC flags.
+    # Also track the `-gencode` pairs per architecture so individual extensions
+    # can opt out of the multi-arch list (see `_qattn_sm90` below).
+    NVCC_BASE_FLAGS = list(NVCC_FLAGS)
+    GENCODE_FLAGS = {}
     for capability in compute_capabilities:
         if capability.startswith("8.0"):
             HAS_SM80 = True
@@ -160,9 +164,11 @@ if not SKIP_CUDA_BUILD:
             num = "120a"
         else:
             continue
-        NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
+        gencode = ["-gencode", f"arch=compute_{num},code=sm_{num}"]
         if capability.endswith("+PTX"):
-            NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+            gencode += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+        GENCODE_FLAGS.setdefault(num, []).extend(gencode)
+        NVCC_FLAGS += gencode
 
     # Fused kernels and QAttn variants
     from torch.utils.cpp_extension import CUDAExtension
@@ -198,6 +204,14 @@ if not SKIP_CUDA_BUILD:
         )
 
     if HAS_SM90:
+        # The Hopper kernels use `wgmma` PTX, which ptxas only accepts for
+        # `sm_90a`. Building this extension for the full arch list fails when
+        # `TORCH_CUDA_ARCH_LIST` includes non-Hopper targets (e.g. `12.0` ->
+        # `sm_120a`), so pin this one extension to its Hopper targets. The
+        # other extensions still build for every requested architecture.
+        sm90_nvcc_flags = NVCC_BASE_FLAGS + GENCODE_FLAGS.get(
+            "90a", ["-gencode", "arch=compute_90a,code=sm_90a"]
+        )
         ext_modules.append(
             CUDAExtension(
                 name="sageattention._qattn_sm90",
@@ -205,7 +219,7 @@ if not SKIP_CUDA_BUILD:
                     "csrc/qattn/pybind_sm90.cpp",
                     "csrc/qattn/qk_int_sv_f8_cuda_sm90.cu",
                 ],
-                extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
+                extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm90_nvcc_flags},
                 extra_link_args=['-lcuda'],
             )
         )
